@@ -106,6 +106,9 @@ class MeetingSession:
         self._shutdown_task: Optional[asyncio.Task] = None
         self._resume = asyncio.Event()
         self._stop_requested = False
+        # Set the instant a stop is requested so poll-interval sleeps wake
+        # immediately instead of waiting out the full interval (STOP latency).
+        self._stop_event = asyncio.Event()
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -128,6 +131,7 @@ class MeetingSession:
             # to write events.jsonl after the dir moved to TEMP).
             return
         self._stop_requested = True
+        self._stop_event.set()
         await self._safe_emit("session.stop_requested")
         if self._task is None:
             return
@@ -317,6 +321,18 @@ class MeetingSession:
             if self.status.state not in (State.FAILED,):
                 self._set_state(State.DONE)
 
+    async def _interruptible_sleep(self, seconds: float) -> None:
+        """Sleep that returns the moment a stop is requested.
+
+        Uninterruptible asyncio.sleep in the poll loop made the STOP button
+        wait out the remainder of a full poll interval before the loop
+        noticed — this wakes as soon as _stop_event is set.
+        """
+        try:
+            await asyncio.wait_for(self._stop_event.wait(), timeout=seconds)
+        except asyncio.TimeoutError:
+            pass
+
     async def _meeting_loop(self) -> None:
         assert self._teams is not None
         solo_since: Optional[float] = None
@@ -342,7 +358,7 @@ class MeetingSession:
             last_set = now_set
 
             if snap.count is None:
-                await asyncio.sleep(settings.participant_poll_seconds)
+                await self._interruptible_sleep(settings.participant_poll_seconds)
                 continue
             real_others = max(0, snap.count - 1)
             if real_others == 0:
@@ -359,7 +375,7 @@ class MeetingSession:
                     await self._safe_emit("session.solo_ended")
                 solo_since = None
 
-            await asyncio.sleep(settings.participant_poll_seconds)
+            await self._interruptible_sleep(settings.participant_poll_seconds)
 
     async def _dump_loop(self) -> None:
         interval = max(5, settings.debug_dump_seconds)
