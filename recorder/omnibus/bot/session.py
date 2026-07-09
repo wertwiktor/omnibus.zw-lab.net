@@ -271,6 +271,11 @@ class MeetingSession:
                     await self._upsert_db(status="recording")
                 await self._teams.open_roster()
                 await asyncio.sleep(2)
+                # Clear the "No Microphone" (and sibling device) banner that
+                # Teams pops right after join, so it doesn't sit in the
+                # recording. The meeting loop keeps sweeping for any that
+                # appear later.
+                await self._teams.dismiss_call_banners()
                 await self._teams.dump_roster_diagnostics(label="t0")
 
                 dump_task = (
@@ -321,6 +326,10 @@ class MeetingSession:
         while not self._stop_requested:
             if await self._teams.detect_meeting_end():
                 raise MeetingEnded("Teams reports meeting ended")
+
+            # Auto-dismiss benign device/network banners (No Microphone, etc.)
+            # as they appear — no-op when none are up.
+            await self._teams.dismiss_call_banners()
 
             snap = await self._teams.snapshot_participants()
             now_set = set(snap.names)

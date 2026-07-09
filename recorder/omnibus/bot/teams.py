@@ -164,6 +164,18 @@ SEL_REMOVED_BANNER = [
     'text=Call ended',
 ]
 
+# In-meeting "User Facing Diagnostics" (ufd_*) notification banners — benign
+# device/network alerts Teams stacks over the meeting view (No Microphone, No
+# Speaker, No Camera, poor network, …). They aren't modal, but they clutter
+# the recording and the live view, so we auto-dismiss them. Every ufd alert
+# renders a close button tagged callingAlertDismissButton_<name>; matching the
+# prefix covers the whole family without chasing each variant. Every one of
+# these is purely a "dismiss this notice" button — none abort the call — so
+# they're safe to click unconditionally.
+SEL_DISMISS_CALL_BANNER = [
+    'button[data-tid^="callingAlertDismissButton_"]',
+]
+
 
 @dataclass
 class ParticipantSnapshot:
@@ -1126,6 +1138,31 @@ class TeamsSession:
         assert self.page is not None
         ended = await _first_visible(self.page, SEL_REMOVED_BANNER)
         return ended is not None
+
+    async def dismiss_call_banners(self) -> int:
+        """Dismiss in-meeting ufd_* notification banners (No Microphone, etc.).
+
+        Returns the number dismissed. Safe to call every poll: each click hits
+        a benign close button and it's a no-op when none are showing. Banners
+        are removed from the DOM on click, which reshuffles the list, so we
+        re-query and take the first visible one each pass rather than indexing
+        a stale locator — bounded so a never-closing banner can't spin.
+        """
+        if self.page is None:
+            return 0
+        dismissed = 0
+        for _ in range(6):
+            btn = await _first_visible(self.page, SEL_DISMISS_CALL_BANNER)
+            if btn is None:
+                break
+            try:
+                tid = await btn.get_attribute("data-tid")
+                await btn.click(timeout=2_000)
+                dismissed += 1
+                await self._emit("teams.call_banner.dismissed", selector=tid)
+            except Exception:
+                break
+        return dismissed
 
     async def open_chat(self) -> bool:
         assert self.page is not None
