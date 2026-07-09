@@ -10,6 +10,7 @@ apt-get install -y -qq \
   ffmpeg xvfb xdotool x11vnc websockify x11-utils \
   pulseaudio matchbox-window-manager \
   fonts-liberation fonts-noto-color-emoji \
+  cifs-utils \
   curl unzip >/dev/null
 
 echo "== app layout =="
@@ -35,12 +36,28 @@ if [ ! -f /opt/omnibus/vendor/noVNC/vnc.html ]; then
   rm /tmp/novnc.tgz
 fi
 
+echo "== CIFS share mount =="
+# The recordings share is a plain _netdev mount, NOT x-systemd.automount:
+# autofs is unavailable inside an LXC container, so the automount unit silently
+# never fires. nofail keeps a share outage from blocking boot. The credentials
+# file is a secret and must be placed manually at the path below (600 perms).
+if ! grep -q '[[:space:]]/mnt/omnibus[[:space:]]' /etc/fstab; then
+  echo '//anubis.zw-lab.net/ZW-OMNIBUS /mnt/omnibus cifs credentials=/root/.smb/anubis-omnibus.cred,iocharset=utf8,vers=3.0,nosharesock,_netdev,nofail 0 0' >> /etc/fstab
+fi
+mkdir -p /mnt/omnibus /root/.smb
+systemctl daemon-reload
+if [ -f /root/.smb/anubis-omnibus.cred ]; then
+  mount /mnt/omnibus 2>/dev/null || echo "  (share mount deferred — check creds/network)"
+else
+  echo "  (place /root/.smb/anubis-omnibus.cred [chmod 600], then: mount /mnt/omnibus)"
+fi
+
 echo "== systemd unit =="
 cat > /etc/systemd/system/omnibus-recorder.service <<'UNIT'
 [Unit]
 Description=ZW-Omnibus meeting recorder API
-After=network-online.target mnt-omnibus.automount
-Wants=network-online.target
+After=network-online.target mnt-omnibus.mount
+Wants=network-online.target mnt-omnibus.mount
 
 [Service]
 Type=simple
