@@ -8,6 +8,7 @@ import structlog
 
 from omnibus.config import settings
 from omnibus.services import recordings as rec_svc
+from omnibus.storage import service as storage
 
 log = structlog.get_logger(__name__)
 
@@ -36,12 +37,15 @@ SYSTEM_PROMPT = (
     "Decisions: bullets, or 'None captured'\n"
     "Action items: 'who — what (when)' bullets, or 'None captured'\n"
     "Open questions: bullets, or 'None'\n"
-    "If the transcript has no substantive content, output a single line: "
+    "Participation: one line noting who spoke most / least from the talk-time "
+    "data, or 'Not available' if no speaking data was captured\n"
+    "If the transcript has no substantive content, still fill Participants and "
+    "Participation from the data, and for the rest output: "
     "'No substantive content captured (voice-only call or very short chat).'"
 )
 
 
-def _build_input(rec: dict, transcript: list[dict]) -> str:
+def _build_input(rec: dict, transcript: list[dict], meta: Optional[dict] = None) -> str:
     parts: list[str] = []
     parts.append(f"Meeting title: {rec.get('title') or '(untitled)'}")
     parts.append(f"Started: {rec.get('started_at') or '?'}")
@@ -50,6 +54,24 @@ def _build_input(rec: dict, transcript: list[dict]) -> str:
         parts.append(f"Duration: {dur // 60}m{dur % 60:02d}s")
     if rec.get("participants"):
         parts.append(f"Participants seen by bot: {', '.join(rec['participants'])}")
+    # Presence + talk-time from metadata.json (voice is not transcribed, so the
+    # speaking data is the only signal about who actually contributed vocally).
+    if meta:
+        timeline = meta.get("participant_timeline") or []
+        if timeline:
+            parts.append("Attendance (offset from start):")
+            for p in timeline:
+                span = f"joined {p.get('first_seen_label', '?')}"
+                if not p.get("still_present", True):
+                    span += f", present ~{int(p.get('seconds_present', 0))}s"
+                parts.append(f"- {p.get('name', '?')}: {span}")
+        totals = meta.get("speaking_totals") or []
+        speakers = [t for t in totals if (t.get("seconds") or 0) > 0]
+        if speakers:
+            parts.append("Talk time (most to least):")
+            for t in speakers:
+                share = f" ({t['share_pct']}%)" if t.get("share_pct") is not None else ""
+                parts.append(f"- {t.get('name', '?')}: {t.get('label', '?')}{share}")
     parts.append("")
     parts.append("Chat transcript (oldest first):")
     if not transcript:
@@ -113,7 +135,8 @@ async def summarize_recording(recording_id: str) -> Optional[dict]:
             return None
         rec_dir = rec_svc.resolve_dir(rec)
         transcript = rec_svc.read_transcript(rec_dir) if rec_dir else []
-        prompt = _build_input(rec, transcript)
+        meta = storage.read_metadata(rec_dir) if rec_dir else None
+        prompt = _build_input(rec, transcript, meta)
         try:
             text = await _run_claude(prompt)
         except SummarizationError:

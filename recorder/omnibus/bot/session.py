@@ -19,6 +19,7 @@ from omnibus.bot.display import DisplayHandle, start_display
 from omnibus.bot.events import EventLog
 from omnibus.bot.recorder import RecorderHandle, start_recorder
 from omnibus.bot.teams import MeetingEnded, SupervisedHandoff, TeamsSession
+from omnibus.bot.tracking import PresenceTracker, SpeakerTracker
 from omnibus.config import settings
 from omnibus.resources import ResourceSlot, pool
 from omnibus.security import User
@@ -109,6 +110,12 @@ class MeetingSession:
         # Set the instant a stop is requested so poll-interval sleeps wake
         # immediately instead of waiting out the full interval (STOP latency).
         self._stop_event = asyncio.Event()
+        # Presence (union of everyone ever in the meeting + join/leave timeline)
+        # and active-speaker (talk-time + speaking segments) tracking. Interval
+        # times are offsets from _t0, set when we reach IN_MEETING.
+        self._presence = PresenceTracker()
+        self._speakers = SpeakerTracker()
+        self._t0: Optional[float] = None
 
     # --- lifecycle ---------------------------------------------------------
 
@@ -269,6 +276,8 @@ class MeetingSession:
                     )
 
                 self._set_state(State.IN_MEETING)
+                # t0 for all presence/speaking interval offsets.
+                self._t0 = asyncio.get_event_loop().time()
                 title = await self._teams.meeting_title()
                 if title:
                     self.status.meeting_title = title
@@ -282,20 +291,28 @@ class MeetingSession:
                 await self._teams.dismiss_call_banners()
                 await self._teams.dump_roster_diagnostics(label="t0")
 
-                dump_task = (
-                    asyncio.create_task(self._dump_loop(), name=f"dump-{self.id}")
-                    if settings.debug_dump_seconds > 0
-                    else None
-                )
+                bg_tasks = []
+                if settings.debug_dump_seconds > 0:
+                    bg_tasks.append(
+                        asyncio.create_task(self._dump_loop(), name=f"dump-{self.id}")
+                    )
+                if settings.speaker_tracking_enabled:
+                    bg_tasks.append(
+                        asyncio.create_task(self._speaker_loop(), name=f"speaker-{self.id}")
+                    )
                 try:
                     await self._meeting_loop()
                 finally:
-                    if dump_task is not None:
-                        dump_task.cancel()
+                    for task in bg_tasks:
+                        task.cancel()
+                    for task in bg_tasks:
                         try:
-                            await dump_task
+                            await task
                         except (asyncio.CancelledError, Exception):
                             pass
+                    # Close any still-open presence/speaking intervals.
+                    self._presence.finalize(self._now_offset())
+                    self._speakers.finalize(self._now_offset())
 
                 self._set_state(State.LEAVING)
                 await self._teams.leave()
@@ -333,10 +350,15 @@ class MeetingSession:
         except asyncio.TimeoutError:
             pass
 
+    def _now_offset(self) -> float:
+        """Seconds since the meeting started (t0), for interval timelines."""
+        if self._t0 is None:
+            return 0.0
+        return max(0.0, asyncio.get_event_loop().time() - self._t0)
+
     async def _meeting_loop(self) -> None:
         assert self._teams is not None
         solo_since: Optional[float] = None
-        last_set: set[str] = set()
         loop = asyncio.get_event_loop()
 
         while not self._stop_requested:
@@ -349,13 +371,21 @@ class MeetingSession:
 
             snap = await self._teams.snapshot_participants()
             now_set = set(snap.names)
-            self.status.participants = sorted(now_set)
+            joined, left = self._presence.update(now_set, self._now_offset())
+            # status.participants is the UNION of everyone ever seen — the full
+            # attendee list the user wants, not just who's on screen right now.
+            self.status.participants = self._presence.everyone
 
-            for name in now_set - last_set:
-                await self._safe_emit("participant.joined", name=name, count=len(now_set))
-            for name in last_set - now_set:
-                await self._safe_emit("participant.left", name=name, count=len(now_set))
-            last_set = now_set
+            for name in joined:
+                await self._safe_emit(
+                    "participant.joined", name=name, count=len(now_set),
+                    at=round(self._now_offset(), 1),
+                )
+            for name in left:
+                await self._safe_emit(
+                    "participant.left", name=name, count=len(now_set),
+                    at=round(self._now_offset(), 1),
+                )
 
             if snap.count is None:
                 await self._interruptible_sleep(settings.participant_poll_seconds)
@@ -389,6 +419,47 @@ class MeetingSession:
                     await self._teams.dump_roster_diagnostics(label=label)
                 except Exception:
                     log.exception("dump.failed")
+        except asyncio.CancelledError:
+            pass
+
+    async def _speaker_loop(self) -> None:
+        """Sample the active-speaker indicator and record speaking segments.
+
+        Runs faster than the participant loop (speaking toggles sub-second).
+        Emits speaker.started / speaker.stopped transitions to the timeline;
+        the SpeakerTracker aggregates segments + talk-time for the metadata.
+        Optionally dumps calibration diagnostics (speaker_debug_dump_seconds).
+        """
+        interval = max(0.25, settings.speaker_poll_seconds)
+        last_dump = 0.0
+        dump_every = settings.speaker_debug_dump_seconds
+        try:
+            while not self._stop_requested:
+                await self._interruptible_sleep(interval)
+                if self._stop_requested:
+                    break
+                if self._teams is None or self._teams.page is None:
+                    continue
+                try:
+                    speaking = await self._teams.snapshot_active_speakers()
+                except Exception:
+                    continue
+                t = self._now_offset()
+                started, stopped = self._speakers.update(speaking, t)
+                for name in started:
+                    await self._safe_emit("speaker.started", name=name, at=round(t, 1))
+                for name, seconds in stopped:
+                    await self._safe_emit(
+                        "speaker.stopped", name=name, at=round(t, 1), seconds=seconds
+                    )
+                if dump_every > 0 and (t - last_dump) >= dump_every:
+                    last_dump = t
+                    try:
+                        await self._teams.dump_speaker_diagnostics(
+                            label=f"spk_{int(time.time())}"
+                        )
+                    except Exception:
+                        log.exception("speaker_dump.failed")
         except asyncio.CancelledError:
             pass
 
@@ -504,6 +575,14 @@ class MeetingSession:
         """Write metadata, move to the share TEMP inbox, update the DB."""
         if self._dir is None:
             return
+        duration_seconds: Optional[int] = None
+        if self.status.started_at and self.status.ended_at:
+            try:
+                a = datetime.fromisoformat(self.status.started_at)
+                b = datetime.fromisoformat(self.status.ended_at)
+                duration_seconds = max(0, int((b - a).total_seconds()))
+            except ValueError:
+                pass
         meta = {
             "recording_id": self.status.recording_id,
             "session_id": self.id,
@@ -514,19 +593,19 @@ class MeetingSession:
             "state": self.status.state.value,
             "started_at": self.status.started_at,
             "ended_at": self.status.ended_at,
-            "duration_seconds": None,
-            "participants_seen": sorted(set(self.status.participants)),
+            "duration_seconds": duration_seconds,
+            # Full attendee list = everyone ever seen (union), not just who was
+            # on screen at the end.
+            "participants_seen": self._presence.everyone,
+            # When each person was in the meeting (join/leave intervals).
+            "participant_timeline": self._presence.timeline(),
+            # Who talked and for how long (offsets relative to meeting start).
+            "speaking_totals": self._speakers.totals(meeting_seconds=duration_seconds),
+            "speaking_timeline": self._speakers.timeline(),
             "used_identity": self.use_identity,
             "error": self.status.error,
             "app": settings.app_name,
         }
-        if self.status.started_at and self.status.ended_at:
-            try:
-                a = datetime.fromisoformat(self.status.started_at)
-                b = datetime.fromisoformat(self.status.ended_at)
-                meta["duration_seconds"] = max(0, int((b - a).total_seconds()))
-            except ValueError:
-                pass
         try:
             storage.write_metadata(self._dir, meta)
         except OSError:

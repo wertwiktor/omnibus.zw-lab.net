@@ -69,6 +69,26 @@ ROSTER_TID_PREFIXES = (
     "attendeesInMeeting-",
     "participantsFromThread-",
 )
+# Substrings that mark the ACTIVE-SPEAKER state on a participant row/tile (the
+# "frame lights up" indicator). Teams toggles a voice-level animation / ring
+# when someone talks. These are PROVISIONAL — our only DOM captures are solo
+# meetings, so the exact token is confirmed on the first multi-party run via
+# dump_speaker_diagnostics(), then this list is tightened. Matched
+# case-insensitively against data-tid / class / aria-label; data-is-speaking
+# ="true" is treated as a definitive signal regardless of this list.
+SPEAKER_SIGNAL_TOKENS = (
+    "isspeaking",
+    "is-speaking",
+    "speaking",
+    "voicelevel",
+    "voice-level",
+    "dominantspeaker",
+    "dominant-speaker",
+    "activespeaker",
+    "active-speaker",
+    "speaker-ring",
+    "speaking-indicator",
+)
 # Small badge in the meeting top bar that shows the total in-call participant
 # count (including the bot). Stays in the DOM even when the People pane is
 # collapsed, so it's the most reliable solo-detection signal.
@@ -1107,6 +1127,105 @@ class TeamsSession:
             except Exception:
                 continue
         return None
+
+    async def snapshot_active_speakers(self) -> set[str]:
+        """Return the set of participant names Teams currently marks as speaking.
+
+        Reads the roster rows (whose data-tid carries the exact name) and looks
+        for the active-speaker signal on the row or any descendant. Roster-based
+        detection is used because the row name is unambiguous and the row stays
+        in the DOM even with the People pane hidden offscreen; Teams lights the
+        roster voice indicator in lockstep with the stage tile's frame.
+
+        Best-effort and defensive: never raises, returns an empty set on any
+        error or when nothing matches. The signal tokens are calibration
+        -pending (see SPEAKER_SIGNAL_TOKENS).
+        """
+        if self.page is None:
+            return set()
+        try:
+            names = await self.page.evaluate(
+                """(cfg) => {
+                  const { prefixes, tokens } = cfg;
+                  const speaking = new Set();
+                  const hasSignal = (el) => {
+                    const nodes = [el, ...el.querySelectorAll('*')];
+                    for (const n of nodes) {
+                      if (!n.getAttribute) continue;
+                      if ((n.getAttribute('data-is-speaking') || '').toLowerCase() === 'true') return true;
+                      const hay = (
+                        (n.getAttribute('data-tid') || '') + ' ' +
+                        (n.getAttribute('class') || '') + ' ' +
+                        (n.getAttribute('aria-label') || '')
+                      ).toLowerCase();
+                      for (const t of tokens) { if (hay.includes(t)) return true; }
+                    }
+                    return false;
+                  };
+                  for (const el of document.querySelectorAll('[data-tid]')) {
+                    const tid = el.getAttribute('data-tid') || '';
+                    let name = null;
+                    for (const p of prefixes) {
+                      if (tid.startsWith(p)) { name = tid.slice(p.length).trim(); break; }
+                    }
+                    if (name && hasSignal(el)) speaking.add(name);
+                  }
+                  return Array.from(speaking);
+                }""",
+                {"prefixes": list(ROSTER_TID_PREFIXES), "tokens": list(SPEAKER_SIGNAL_TOKENS)},
+            )
+            return {n for n in (names or []) if n}
+        except Exception:
+            return set()
+
+    async def dump_speaker_diagnostics(self, label: str) -> None:
+        """Dump the raw roster/tile DOM so the speaking selector can be pinned.
+
+        Saves speaker_<label>.json (per-candidate outerHTML + attributes) and
+        speaker_<label>.png. Running this across a real multi-party meeting —
+        with someone talking — lets us diff a speaking row against a silent one
+        and lock SPEAKER_SIGNAL_TOKENS to the token that actually toggles.
+        """
+        if self.page is None or self.debug_dir is None:
+            return
+        import json as _json
+
+        self.debug_dir.mkdir(parents=True, exist_ok=True)
+        png = self.debug_dir / f"speaker_{label}.png"
+        meta = self.debug_dir / f"speaker_{label}.json"
+        try:
+            await self.page.screenshot(path=str(png))
+        except Exception:
+            pass
+        try:
+            data = await self.page.evaluate(
+                """(prefixes) => {
+                  const trim = (s) => (s || '').slice(0, 4000);
+                  const rows = [];
+                  for (const el of document.querySelectorAll('[data-tid]')) {
+                    const tid = el.getAttribute('data-tid') || '';
+                    if (!prefixes.some(p => tid.startsWith(p))) continue;
+                    rows.push({ 'data-tid': tid, html: trim(el.outerHTML) });
+                  }
+                  // Stage tiles — candidate video-tile containers for the frame.
+                  const tiles = [];
+                  const tileSel = '[data-tid*="tile" i],[data-tid*="stream" i],[data-tid*="stage" i],[data-tid*="render" i]';
+                  for (const el of document.querySelectorAll(tileSel)) {
+                    tiles.push({
+                      'data-tid': el.getAttribute('data-tid'),
+                      'aria-label': el.getAttribute('aria-label'),
+                      class: (el.className || '').toString().slice(0, 200),
+                      html: trim(el.outerHTML),
+                    });
+                  }
+                  return { rows, tiles: tiles.slice(0, 30) };
+                }""",
+                list(ROSTER_TID_PREFIXES),
+            )
+            meta.write_text(_json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception as e:
+            await self._emit_action("speaker.diag_failed", error=str(e)[:200])
+        await self._emit("teams.speaker.diagnostic_saved", label=label)
 
     async def meeting_title(self) -> str | None:
         assert self.page is not None

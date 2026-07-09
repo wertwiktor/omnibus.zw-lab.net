@@ -68,6 +68,17 @@ class Settings(BaseSettings):
     join_timeout_seconds: int = 90
     debug_dump_seconds: int = 0  # noisy diagnostics off by default in prod
 
+    # --- active-speaker tracking -----------------------------------------
+    speaker_tracking_enabled: bool = True
+    # How often to sample the Teams "speaking" indicator. Speaking toggles
+    # sub-second; ~1s sampling gives a faithful timeline without hammering the
+    # DOM. Segments shorter than one interval may be missed.
+    speaker_poll_seconds: float = 1.0
+    # When >0, the speaker sampler also dumps the raw tile/roster DOM every N
+    # seconds (dump_speaker_diagnostics) so the "speaking" selector can be
+    # calibrated against a real multi-party meeting. Off in prod.
+    speaker_debug_dump_seconds: int = 0
+
     # --- AI summarization ----------------------------------------------------
     summary_enabled: bool = True
     summary_auto_on_end: bool = True
