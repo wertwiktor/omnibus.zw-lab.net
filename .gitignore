@@ -1,0 +1,27 @@
+# Installed artifacts — rebuilt by deploy/bootstrap-ct.sh, never source.
+venv/
+pw-browsers/
+
+# Python caches / build metadata
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Runtime data (normally lives outside the repo under /var/lib/omnibus,
+# but ignore here too in case anything is generated in-tree).
+*.mp4
+*.log
+rec/
+profiles/
+
+# Local secrets — the real file lives at /etc/omnibus/recorder.env.
+*.env
+.env
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
