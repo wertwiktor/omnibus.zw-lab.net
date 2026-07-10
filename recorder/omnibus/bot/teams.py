@@ -69,25 +69,19 @@ ROSTER_TID_PREFIXES = (
     "attendeesInMeeting-",
     "participantsFromThread-",
 )
-# Substrings that mark the ACTIVE-SPEAKER state on a participant row/tile (the
-# "frame lights up" indicator). Teams toggles a voice-level animation / ring
-# when someone talks. These are PROVISIONAL — our only DOM captures are solo
-# meetings, so the exact token is confirmed on the first multi-party run via
-# dump_speaker_diagnostics(), then this list is tightened. Matched
-# case-insensitively against data-tid / class / aria-label; data-is-speaking
-# ="true" is treated as a definitive signal regardless of this list.
-SPEAKER_SIGNAL_TOKENS = (
-    "isspeaking",
-    "is-speaking",
-    "speaking",
-    "voicelevel",
-    "voice-level",
-    "dominantspeaker",
-    "dominant-speaker",
-    "activespeaker",
-    "active-speaker",
-    "speaker-ring",
-    "speaking-indicator",
+# The ACTIVE-SPEAKER signal, confirmed against a real 7-person meeting capture
+# (2026-07-10). Teams puts a "frame" element on every stage tile and flips its
+# data-is-speaking attribute when that person talks:
+#   <div data-tid="voice-level-stream-outline" data-is-speaking="true|false">
+# This is authoritative (no heuristics). The outline div is nameless, so we map
+# it to a participant via the tile's data-person-mri, resolved to a display
+# name through the roster rows (which carry both the name in data-tid and the
+# mri on a child). Prefixes used to build that mri->name map:
+SPEAKER_NAME_PREFIXES = (
+    "participantsInCall-",
+    "attendeesInMeeting-",
+    "participantsFromThread-",
+    "participantsFromMeeting-",
 )
 # Small badge in the meeting top bar that shows the total in-call participant
 # count (including the bot). Stays in the DOM even when the People pane is
@@ -1131,48 +1125,57 @@ class TeamsSession:
     async def snapshot_active_speakers(self) -> set[str]:
         """Return the set of participant names Teams currently marks as speaking.
 
-        Reads the roster rows (whose data-tid carries the exact name) and looks
-        for the active-speaker signal on the row or any descendant. Roster-based
-        detection is used because the row name is unambiguous and the row stays
-        in the DOM even with the People pane hidden offscreen; Teams lights the
-        roster voice indicator in lockstep with the stage tile's frame.
+        Reads the authoritative signal — a stage tile's
+        `voice-level-stream-outline[data-is-speaking="true"]` frame — and maps
+        each speaking tile to a display name via its `data-person-mri`,
+        resolved through the roster's mri->name table. Falls back to the tile's
+        nametag text when the mri isn't in the roster (e.g. externals).
 
-        Best-effort and defensive: never raises, returns an empty set on any
-        error or when nothing matches. The signal tokens are calibration
-        -pending (see SPEAKER_SIGNAL_TOKENS).
+        Defensive: never raises, returns an empty set on any error.
         """
         if self.page is None:
             return set()
         try:
             names = await self.page.evaluate(
-                """(cfg) => {
-                  const { prefixes, tokens } = cfg;
-                  const speaking = new Set();
-                  const hasSignal = (el) => {
-                    const nodes = [el, ...el.querySelectorAll('*')];
-                    for (const n of nodes) {
-                      if (!n.getAttribute) continue;
-                      if ((n.getAttribute('data-is-speaking') || '').toLowerCase() === 'true') return true;
-                      const hay = (
-                        (n.getAttribute('data-tid') || '') + ' ' +
-                        (n.getAttribute('class') || '') + ' ' +
-                        (n.getAttribute('aria-label') || '')
-                      ).toLowerCase();
-                      for (const t of tokens) { if (hay.includes(t)) return true; }
-                    }
-                    return false;
-                  };
+                """(prefixes) => {
+                  // 1. mri -> display name, from roster rows (reliable names).
+                  const mriToName = {};
                   for (const el of document.querySelectorAll('[data-tid]')) {
                     const tid = el.getAttribute('data-tid') || '';
                     let name = null;
                     for (const p of prefixes) {
                       if (tid.startsWith(p)) { name = tid.slice(p.length).trim(); break; }
                     }
-                    if (name && hasSignal(el)) speaking.add(name);
+                    if (!name) continue;
+                    const m = el.querySelector('[data-person-mri]');
+                    if (m) { const mri = m.getAttribute('data-person-mri'); if (mri) mriToName[mri] = name; }
+                  }
+                  // 2. For a speaking outline, climb to its tile and read the
+                  //    name: first ancestor bearing a person-mri is the tile.
+                  const nameForTile = (start) => {
+                    let node = start;
+                    for (let up = 0; up < 10 && node; up++) {
+                      const m = node.querySelector && node.querySelector('[data-person-mri]');
+                      if (m) {
+                        const mri = m.getAttribute('data-person-mri');
+                        if (mri && mriToName[mri]) return mriToName[mri];
+                        const tag = node.querySelector('[data-tid="participant-info-nametag"]');
+                        if (tag) { const t = (tag.textContent || '').trim(); if (t) return t; }
+                        if (mri) return null;
+                      }
+                      node = node.parentElement;
+                    }
+                    return null;
+                  };
+                  const speaking = new Set();
+                  const sel = '[data-tid="voice-level-stream-outline"][data-is-speaking="true"]';
+                  for (const o of document.querySelectorAll(sel)) {
+                    const name = nameForTile(o);
+                    if (name) speaking.add(name);
                   }
                   return Array.from(speaking);
                 }""",
-                {"prefixes": list(ROSTER_TID_PREFIXES), "tokens": list(SPEAKER_SIGNAL_TOKENS)},
+                list(SPEAKER_NAME_PREFIXES),
             )
             return {n for n in (names or []) if n}
         except Exception:
@@ -1191,12 +1194,11 @@ class TeamsSession:
         import json as _json
 
         self.debug_dir.mkdir(parents=True, exist_ok=True)
-        png = self.debug_dir / f"speaker_{label}.png"
         meta = self.debug_dir / f"speaker_{label}.json"
-        try:
-            await self.page.screenshot(path=str(png))
-        except Exception:
-            pass
+        # NOTE: deliberately no screenshot here. A full-page PNG per sample
+        # (~1.4MB) at a 3s cadence produced ~800MB of debug images over a 35min
+        # meeting, which then had to copy to the CIFS share and made
+        # "finalizing" crawl. The JSON DOM alone is what calibration needs.
         try:
             data = await self.page.evaluate(
                 """(prefixes) => {
